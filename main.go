@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +63,29 @@ func (store *RateLimiterStore) cleanup() {
 	}
 }
 
+func getClientIP(r *http.Request) string {
+	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
+		return cfIP
+	}
+
+	if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+		ips := strings.Split(forwardedFor, ",")
+		if len(ips) > 0 {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return realIP
+	}
+
+	ip := r.RemoteAddr
+	if colonIndex := strings.LastIndex(ip, ":"); colonIndex != -1 {
+		ip = ip[:colonIndex]
+	}
+	return ip
+}
+
 func (store *RateLimiterStore) getLimiter(key string) *rate.Limiter {
 	store.Lock()
 	defer store.Unlock()
@@ -69,7 +93,7 @@ func (store *RateLimiterStore) getLimiter(key string) *rate.Limiter {
 	limiter, exists := store.limiters[key]
 	if !exists {
 		limiter = &RateLimiter{
-			limiter:  rate.NewLimiter(rate.Every(time.Minute/100), 10),
+			limiter:  rate.NewLimiter(rate.Every(time.Minute/RequestsPerMinute), BurstSize),
 			lastSeen: time.Now(),
 		}
 		store.limiters[key] = limiter
@@ -81,17 +105,14 @@ func (store *RateLimiterStore) getLimiter(key string) *rate.Limiter {
 
 func withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := r.RemoteAddr
-		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
-			ip = forwardedFor
-		}
+		ip := getClientIP(r)
 
 		if !ipLimiters.getLimiter(ip).Allow() {
 			http.Error(w, "IP rate limit exceeded", http.StatusTooManyRequests)
 			return
 		}
 
-		tunnelID := ""
+		var tunnelID string
 		if r.Method == http.MethodGet {
 			tunnelID = r.URL.Query().Get("id")
 			if tunnelID == "" {
@@ -99,14 +120,16 @@ func withRateLimit(next http.HandlerFunc) http.HandlerFunc {
 			}
 		} else if r.Method == http.MethodPost {
 			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
-				tunnelID = body["id"]
-				if tunnelID == "" {
-					tunnelID = body["ID"]
+			bodyBytes, err := io.ReadAll(r.Body)
+			if err == nil {
+				if err := json.Unmarshal(bodyBytes, &body); err == nil {
+					tunnelID = body["id"]
+					if tunnelID == "" {
+						tunnelID = body["ID"]
+					}
 				}
 				// Restore body for next handler
-				jsonBody, _ := json.Marshal(body)
-				r.Body = io.NopCloser(bytes.NewBuffer(jsonBody))
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 			}
 		}
 
