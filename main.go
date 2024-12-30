@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -8,7 +9,117 @@ import (
 	"math/rand"
 	"net/http"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 )
+
+const (
+	RequestsPerMinute = 100           // Requests per minute for each IP
+	BurstSize         = 10            // Burst size for rate limiter
+	CleanupInterval   = 1 * time.Hour // How often to cleanup old rate limiters
+)
+
+type RateLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+type RateLimiterStore struct {
+	sync.RWMutex
+	limiters    map[string]*RateLimiter
+	cleanupFreq time.Duration
+}
+
+var (
+	ipLimiters = &RateLimiterStore{
+		limiters:    make(map[string]*RateLimiter),
+		cleanupFreq: CleanupInterval,
+	}
+
+	tunnelLimiters = &RateLimiterStore{
+		limiters:    make(map[string]*RateLimiter),
+		cleanupFreq: CleanupInterval,
+	}
+)
+
+func init() {
+	go ipLimiters.cleanup()
+	go tunnelLimiters.cleanup()
+}
+
+func (store *RateLimiterStore) cleanup() {
+	for {
+		time.Sleep(store.cleanupFreq)
+
+		store.Lock()
+		for ip, limiter := range store.limiters {
+			if time.Since(limiter.lastSeen) > store.cleanupFreq {
+				delete(store.limiters, ip)
+			}
+		}
+		store.Unlock()
+	}
+}
+
+func (store *RateLimiterStore) getLimiter(key string) *rate.Limiter {
+	store.Lock()
+	defer store.Unlock()
+
+	limiter, exists := store.limiters[key]
+	if !exists {
+		limiter = &RateLimiter{
+			limiter:  rate.NewLimiter(rate.Every(time.Minute/100), 10),
+			lastSeen: time.Now(),
+		}
+		store.limiters[key] = limiter
+	}
+
+	limiter.lastSeen = time.Now()
+	return limiter.limiter
+}
+
+func withRateLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip := r.RemoteAddr
+		if forwardedFor := r.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+			ip = forwardedFor
+		}
+
+		if !ipLimiters.getLimiter(ip).Allow() {
+			http.Error(w, "IP rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
+		tunnelID := ""
+		if r.Method == http.MethodGet {
+			tunnelID = r.URL.Query().Get("id")
+			if tunnelID == "" {
+				tunnelID = r.URL.Query().Get("ID")
+			}
+		} else if r.Method == http.MethodPost {
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				tunnelID = body["id"]
+				if tunnelID == "" {
+					tunnelID = body["ID"]
+				}
+				// Restore body for next handler
+				jsonBody, _ := json.Marshal(body)
+				r.Body = io.NopCloser(bytes.NewBuffer(jsonBody))
+			}
+		}
+
+		if tunnelID != "" {
+			if !tunnelLimiters.getLimiter(tunnelID).Allow() {
+				http.Error(w, "Tunnel rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		next(w, r)
+	}
+}
 
 type Tunnel struct {
 	ID          string
@@ -25,10 +136,10 @@ func main() {
 	log.Println("Starting server on port 2427")
 	http.HandleFunc("/", withCORS(homePage))
 	http.HandleFunc("/LICENSE", withCORS(giveLicense))
-	http.HandleFunc("/api/v3/tunnel/create", withCORS(createTunnel))
-	http.HandleFunc("/api/v3/tunnel/stream", withCORS(streamTunnelContent))
-	http.HandleFunc("/api/v3/tunnel/get", withCORS(getTunnelContent))
-	http.HandleFunc("/api/v3/tunnel/send", withCORS(sendToTunnel))
+	http.HandleFunc("/api/v3/tunnel/create", withCORS(withRateLimit(createTunnel)))
+	http.HandleFunc("/api/v3/tunnel/stream", withCORS(withRateLimit(streamTunnelContent)))
+	http.HandleFunc("/api/v3/tunnel/get", withCORS(withRateLimit(getTunnelContent)))
+	http.HandleFunc("/api/v3/tunnel/send", withCORS(withRateLimit(sendToTunnel)))
 	log.Fatal(http.ListenAndServe(":2427", nil))
 }
 
